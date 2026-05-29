@@ -1,21 +1,26 @@
 import Foundation
 import AppKit
-import Combine
 import os.log
 
 private let logger = Logger(subsystem: "com.trafficlight.app", category: "manager")
 
 /// Manages traffic light windows for each Claude terminal.
 ///
-/// Owns the *only* polling timer in the app: every tick it (1) refreshes the
-/// list of Claude windows, (2) asks ProcessMonitor for each window's state,
-/// (3) pushes that state into the matching panel. This keeps the AX reads
-/// serialized and avoids per-panel timers racing each other.
+/// Threading model (this matters — see "stuck cursor" bug):
+///   - Heavy work (pgrep / ps fork+exec, AX tree traversal) runs on a
+///     background serial queue. None of it touches the main thread.
+///   - Only the final UI mutation (creating/closing panels, applying state)
+///     hops back to the main thread.
+///   - Timer ticks are coalesced: if a previous tick is still running we
+///     skip this one rather than queue them up.
 class TrafficLightManager {
     private let windowDetector: WindowDetector
     private let processMonitor: ProcessMonitor
     private var trafficLightWindows: [ClaudeWindow: TrafficLightPanel] = [:]
     private var timer: Timer?
+
+    private let workQueue = DispatchQueue(label: "com.trafficlight.work", qos: .utility)
+    private var tickInFlight = false
 
     init(windowDetector: WindowDetector, processMonitor: ProcessMonitor) {
         self.windowDetector = windowDetector
@@ -25,9 +30,7 @@ class TrafficLightManager {
     func startMonitoring() {
         logger.info("startMonitoring called")
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.tick()
-            }
+            self?.scheduleTick()
         }
         RunLoop.current.add(timer!, forMode: .common)
     }
@@ -37,10 +40,38 @@ class TrafficLightManager {
         timer = nil
     }
 
+    private func scheduleTick() {
+        // Coalesce: if last tick is still running (e.g. AX call is slow), skip.
+        // We'd rather drop a sample than back up the work queue.
+        if tickInFlight { return }
+        tickInFlight = true
+        workQueue.async { [weak self] in
+            self?.tick()
+            self?.tickInFlight = false
+        }
+    }
+
+    /// Background-thread tick. Reads windows + state, then hops to main for UI.
     private func tick() {
         let currentWindows = windowDetector.detectClaudeWindows()
+
+        // Compute the (window -> state) map off the main thread. ProcessMonitor
+        // is only touched here, on this serial work queue, so no locking needed.
+        var states: [ClaudeWindow: TrafficLightState] = [:]
+        for w in currentWindows {
+            states[w] = processMonitor.getState(for: w)
+        }
+        processMonitor.prune(activeWindows: currentWindows)
+
+        // Apply to UI on the main thread. This is fast: dictionary diff +
+        // setting properties on NSPanels.
+        DispatchQueue.main.async { [weak self] in
+            self?.applyToUI(currentWindows: currentWindows, states: states)
+        }
+    }
+
+    private func applyToUI(currentWindows: [ClaudeWindow], states: [ClaudeWindow: TrafficLightState]) {
         let currentSet = Set(currentWindows)
-        logger.info("Detected \(currentWindows.count) Claude windows")
 
         // Drop panels for windows that disappeared.
         for (window, panel) in trafficLightWindows where !currentSet.contains(window) {
@@ -50,23 +81,18 @@ class TrafficLightManager {
 
         // Spin up panels for new windows.
         for window in currentWindows where trafficLightWindows[window] == nil {
-            logger.info("Creating traffic light for: \(window.appName)")
             let panel = TrafficLightPanel(claudeWindow: window)
             trafficLightWindows[window] = panel
             panel.show()
         }
 
-        // Update each panel: position + state. Reading state here (instead of
-        // in each panel) means ProcessMonitor sees one call per window per
-        // tick, in deterministic order — fixes the cross-terminal interference.
+        // Update each panel: position + state.
         for window in currentWindows {
             guard let panel = trafficLightWindows[window] else { continue }
             panel.updatePosition(near: window.frame)
-            let state = processMonitor.getState(for: window)
-            panel.apply(state: state)
+            if let state = states[window] {
+                panel.apply(state: state)
+            }
         }
-
-        // Free per-window tracking for windows that no longer exist.
-        processMonitor.prune(activeWindows: currentWindows)
     }
 }
