@@ -7,14 +7,11 @@ private let logger = Logger(subsystem: "com.trafficlight.app", category: "panel"
 /// Floating panel that displays a traffic light for a Claude window
 class TrafficLightPanel: NSPanel {
     private let claudeWindow: ClaudeWindow
-    private let processMonitor: ProcessMonitor
     private var hostingView: NSHostingView<TrafficLightView>?
     private var currentState: TrafficLightState = .green
-    private var timer: Timer?
 
-    init(claudeWindow: ClaudeWindow, processMonitor: ProcessMonitor) {
+    init(claudeWindow: ClaudeWindow) {
         self.claudeWindow = claudeWindow
-        self.processMonitor = processMonitor
 
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 40, height: 100),
@@ -32,14 +29,10 @@ class TrafficLightPanel: NSPanel {
         self.hidesOnDeactivate = false
 
         setupView()
-        startMonitoring()
     }
 
     private func setupView() {
-        let view = TrafficLightView(state: currentState) { [weak self] in
-            self?.focusTerminal()
-        }
-
+        let view = TrafficLightView(state: currentState)
         hostingView = NSHostingView(rootView: view)
         contentView = hostingView
     }
@@ -62,48 +55,106 @@ class TrafficLightPanel: NSPanel {
     }
 
     private func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.checkState()
-        }
+        // Monitoring is owned by TrafficLightManager now; nothing to do here.
+    }
+
+    /// Push a new state in from the manager.
+    func apply(state: TrafficLightState) {
+        guard state != currentState else { return }
+        currentState = state
+        updateView()
     }
 
     private func checkState() {
-        let newState = processMonitor.getState(for: claudeWindow)
-        if newState != currentState {
-            currentState = newState
-            updateView()
-        }
+        // Deprecated path kept only to avoid breaking callers; manager pushes state.
     }
 
     private func updateView() {
-        let view = TrafficLightView(state: currentState) { [weak self] in
-            self?.focusTerminal()
-        }
+        let view = TrafficLightView(state: currentState)
         hostingView?.rootView = view
     }
 
     private func focusTerminal() {
-        guard let app = NSRunningApplication(processIdentifier: claudeWindow.processID) else { return }
-        app.activate(options: [.activateIgnoringOtherApps])
+        // Raise the specific terminal window for this Claude instance
+        // (not just any window of the app), then activate the app.
+        // CGWindow and AXUIElement use the same flipped-screen coordinate
+        // space (top-left origin), so we can compare their frames directly.
+        let appRef = AXUIElementCreateApplication(claudeWindow.processID)
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let windows = windowsRef as? [AXUIElement] {
+            var best: (AXUIElement, CGFloat)? = nil
+            for w in windows {
+                var posRef: CFTypeRef?
+                var sizeRef: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(w, kAXPositionAttribute as CFString, &posRef) == .success,
+                      AXUIElementCopyAttributeValue(w, kAXSizeAttribute as CFString, &sizeRef) == .success,
+                      let p = posRef, let s = sizeRef else { continue }
+                var pt = CGPoint.zero, sz = CGSize.zero
+                AXValueGetValue(p as! AXValue, .cgPoint, &pt)
+                AXValueGetValue(s as! AXValue, .cgSize, &sz)
+                let dx = pt.x - claudeWindow.frame.origin.x
+                let dy = pt.y - claudeWindow.frame.origin.y
+                let dw = sz.width - claudeWindow.frame.width
+                let dh = sz.height - claudeWindow.frame.height
+                let dist = dx * dx + dy * dy + dw * dw + dh * dh
+                if best == nil || dist < best!.1 { best = (w, dist) }
+            }
+            if let (target, _) = best {
+                AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+                AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
+                AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            }
+        }
+        NSRunningApplication(processIdentifier: claudeWindow.processID)?
+            .activate(options: [.activateIgnoringOtherApps])
     }
 
+    // Click handling.
+    //
+    // Single click = focus terminal. Drag = move panel.
+    //
+    // Implementation note: we must NOT call the blocking performDrag from
+    // mouseDown — that pumps the run loop until mouse-up and previously left
+    // the cursor stuck as "loading" on bare clicks. Instead:
+    //   mouseDown    -> remember start, return immediately
+    //   mouseDragged -> once moved past threshold, performDrag (it's now
+    //                   guaranteed to receive a mouse-up and exit cleanly)
+    //   mouseUp      -> if we never crossed the drag threshold, treat as
+    //                   click and focus the terminal.
+    private var mouseDownLocation: NSPoint = .zero
+    private var didDrag: Bool = false
+    private let dragThreshold: CGFloat = 4.0
+
     override func mouseDown(with event: NSEvent) {
-        // Allow dragging
-        performDrag(with: event)
+        mouseDownLocation = event.locationInWindow
+        didDrag = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let p = event.locationInWindow
+        let dx = p.x - mouseDownLocation.x
+        let dy = p.y - mouseDownLocation.y
+        if !didDrag && (dx * dx + dy * dy) >= dragThreshold * dragThreshold {
+            didDrag = true
+            performDrag(with: event)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if didDrag { return }
+        focusTerminal()
     }
 
     deinit {
-        timer?.invalidate()
     }
 }
 
 // MARK: - Traffic Light View (3 lights: red, yellow, green)
 struct TrafficLightView: View {
     let state: TrafficLightState
-    let onDoubleClick: () -> Void
-
-    @State private var clickCount = 0
-    @State private var lastClickTime = Date()
+    // Click handling is owned by NSPanel.mouseDown/mouseUp; SwiftUI gestures
+    // here would only fight with that.
 
     var body: some View {
         ZStack {
@@ -125,36 +176,14 @@ struct TrafficLightView: View {
 
             // Three lights stacked vertically
             VStack(spacing: 6) {
-                // Red light (busy/working)
-                LightView(color: .red, isOn: state == .red, isGlowing: state == .red)
-
-                // Yellow light (waiting for decision)
+                LightView(color: .red,    isOn: state == .red,    isGlowing: state == .red)
                 LightView(color: .yellow, isOn: state == .yellow, isGlowing: state == .yellow)
-
-                // Green light (completed/idle)
-                LightView(color: .green, isOn: state == .green, isGlowing: state == .green)
+                LightView(color: .green,  isOn: state == .green,  isGlowing: state == .green)
             }
         }
         .frame(width: 40, height: 100)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            handleTap()
-        }
-    }
-
-    private func handleTap() {
-        let now = Date()
-        if now.timeIntervalSince(lastClickTime) < 0.3 {
-            clickCount += 1
-        } else {
-            clickCount = 1
-        }
-        lastClickTime = now
-
-        if clickCount >= 2 {
-            onDoubleClick()
-            clickCount = 0
-        }
+        // Let mouse events fall through to the hosting NSPanel.
+        .allowsHitTesting(false)
     }
 }
 

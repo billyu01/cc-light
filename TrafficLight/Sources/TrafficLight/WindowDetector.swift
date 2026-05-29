@@ -22,223 +22,141 @@ struct ClaudeWindow: Hashable {
     }
 }
 
-/// Detects terminal windows running Claude Code
+/// Snapshot of the process table: pid -> (ppid, comm).
+private struct ProcSnapshot {
+    var ppid: [pid_t: pid_t] = [:]
+    var comm: [pid_t: String] = [:]
+}
+
+/// Detects terminal windows running Claude Code.
+///
+/// Performance note: the previous implementation forked `pgrep` / `ps` once
+/// per pid per parent-walk step (potentially 30+ subprocesses per tick). On
+/// macOS each subprocess is ~5-15 ms, so a single tick blocked the main
+/// thread for hundreds of ms — that's why hovering the panel turned the
+/// cursor into a beachball. We now take ONE `ps -Ao pid=,ppid=,comm=`
+/// snapshot per tick and walk it entirely in Swift.
 class WindowDetector {
+
+    private let terminalNames: Set<String> = [
+        "terminal", "iterm", "iterm2", "ghostty", "alacritty",
+        "kitty", "warp", "hyper", "wezterm", "tabby"
+    ]
 
     /// Find all terminal windows running Claude Code
     func detectClaudeWindows() -> [ClaudeWindow] {
-        var claudeWindows: [ClaudeWindow] = []
+        // 1. Single-shot read of the process table.
+        let snap = readProcessSnapshot()
 
-        // Get Claude process IDs
-        let claudePIDs = getClaudeProcessIDs()
+        // 2. Find Claude processes by command name (no -f match against full
+        //    cmdline — too easy to false-positive on paths containing "claude").
+        let claudePIDs = snap.comm.compactMap { (pid, comm) -> pid_t? in
+            comm.lowercased() == "claude" ? pid : nil
+        }
         guard !claudePIDs.isEmpty else { return [] }
 
-        // Get parent terminal process IDs
-        let terminalPIDs = getParentTerminalPIDs(for: claudePIDs)
-
-        // Get all windows
-        guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return []
-        }
-
-        for windowInfo in windowList {
-            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID,
-                  let pid = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
-                  let bounds = windowInfo[kCGWindowBounds as String] as? [String: CGFloat],
-                  let ownerName = windowInfo[kCGWindowOwnerName as String] as? String else {
-                continue
+        // 3. Walk up each Claude pid's ancestry in the snapshot to find a
+        //    terminal app process.
+        var terminalPIDs = Set<pid_t>()
+        for cpid in claudePIDs {
+            var cur: pid_t = cpid
+            for _ in 0..<10 {
+                guard let parent = snap.ppid[cur], parent > 0 else { break }
+                if let comm = snap.comm[parent], isTerminalComm(comm) {
+                    terminalPIDs.insert(parent)
+                    break
+                }
+                cur = parent
             }
+        }
+        guard !terminalPIDs.isEmpty else { return [] }
 
-            // Skip windows with zero size
+        // 4. Match those terminal PIDs against on-screen windows.
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return [] }
+
+        var claudeWindows: [ClaudeWindow] = []
+        for info in windowList {
+            guard let windowID = info[kCGWindowNumber as String] as? CGWindowID,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let ownerName = info[kCGWindowOwnerName as String] as? String else { continue }
+
             let width = bounds["Width"] ?? 0
             let height = bounds["Height"] ?? 0
             guard width > 100 && height > 100 else { continue }
 
-            // Check if this window belongs to a terminal app running Claude
-            if terminalPIDs.contains(pid) {
-                let title = windowInfo[kCGWindowName as String] as? String ?? ""
-                let frame = CGRect(
-                    x: bounds["X"] ?? 0,
-                    y: bounds["Y"] ?? 0,
-                    width: width,
-                    height: height
-                )
+            guard terminalPIDs.contains(pid) else { continue }
 
-                let window = ClaudeWindow(
-                    windowID: windowID,
-                    processID: pid,
-                    windowTitle: title,
-                    appName: ownerName,
-                    frame: frame
-                )
-                claudeWindows.append(window)
-            }
+            let title = info[kCGWindowName as String] as? String ?? ""
+            let frame = CGRect(
+                x: bounds["X"] ?? 0,
+                y: bounds["Y"] ?? 0,
+                width: width,
+                height: height
+            )
+            claudeWindows.append(ClaudeWindow(
+                windowID: windowID,
+                processID: pid,
+                windowTitle: title,
+                appName: ownerName,
+                frame: frame
+            ))
         }
 
         return claudeWindows
     }
 
-    /// Get all Claude Code process IDs
-    private func getClaudeProcessIDs() -> [pid_t] {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-f", "claude"]
+    // MARK: - Process snapshot
 
-        let pipe = Pipe()
-        task.standardOutput = pipe
+    /// One subprocess call, parsed in Swift. Replaces dozens of per-pid
+    /// invocations from the old implementation.
+    private func readProcessSnapshot() -> ProcSnapshot {
+        var snap = ProcSnapshot()
 
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return [] }
-
-            return output.components(separatedBy: "\n")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-                .map { pid_t($0) }
-        } catch {
-            return []
-        }
-    }
-
-    /// Get parent terminal process IDs for Claude processes
-    private func getParentTerminalPIDs(for claudePIDs: [pid_t]) -> Set<pid_t> {
-        var terminalPIDs = Set<pid_t>()
-
-        for claudePID in claudePIDs {
-            // Traverse up the process tree to find terminal
-            var currentPID: pid_t? = claudePID
-            var depth = 0
-            while let pid = currentPID, depth < 10 {
-                if let parentPID = getParentPID(for: pid) {
-                    // Check if parent is a terminal app
-                    if isTerminalProcess(parentPID) {
-                        terminalPIDs.insert(parentPID)
-                    }
-                    currentPID = parentPID
-                    depth += 1
-                } else {
-                    break
-                }
-            }
-        }
-
-        return terminalPIDs
-    }
-
-    /// Check if a process is a terminal application
-    private func isTerminalProcess(_ pid: pid_t) -> Bool {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-p", "\(pid)", "-o", "comm="]
+        task.arguments = ["-Ao", "pid=,ppid=,comm="]
 
         let pipe = Pipe()
         task.standardOutput = pipe
+        task.standardError = Pipe()
 
         do {
             try task.run()
             task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return false }
-
-            let comm = output.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let terminalNames = ["terminal", "iterm", "ghostty", "alacritty", "kitty", "warp", "hyper"]
-            return terminalNames.contains { comm.contains($0) }
         } catch {
-            return false
+            return snap
         }
-    }
 
-    /// Get parent process ID
-    private func getParentPID(for pid: pid_t) -> pid_t? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-p", "\(pid)", "-o", "ppid="]
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return snap }
 
-        let pipe = Pipe()
-        task.standardOutput = pipe
+        for line in output.split(separator: "\n") {
+            // Format: "  PID  PPID COMM..." — comm may contain spaces / a path.
+            let trimmed = line.drop(while: { $0 == " " })
+            let parts = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard parts.count >= 3,
+                  let pid = pid_t(parts[0]),
+                  let ppid = pid_t(parts[1]) else { continue }
 
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return nil }
-
-            return Int(output.trimmingCharacters(in: .whitespacesAndNewlines)).map { pid_t($0) }
-        } catch {
-            return nil
+            let commPath = String(parts[2])
+            // comm is often a full path; we only need the basename.
+            let comm = (commPath as NSString).lastPathComponent
+            snap.ppid[pid] = ppid
+            snap.comm[pid] = comm
         }
+
+        return snap
     }
 
-    /// Check if a terminal process is running Claude
-    private func isTerminalRunningClaude(pid: pid_t, claudePIDs: [pid_t]) -> Bool {
-        // Get all child processes of this terminal
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-P", "\(pid)"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return false }
-
-            let childPIDs = output.components(separatedBy: "\n")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-                .map { pid_t($0) }
-
-            // Check if any child or descendant is a Claude process
-            for childPID in childPIDs {
-                if claudePIDs.contains(childPID) {
-                    return true
-                }
-                // Recursively check descendants
-                if hasClaudeDescendant(pid: childPID, claudePIDs: claudePIDs) {
-                    return true
-                }
-            }
-        } catch {}
-
-        return false
-    }
-
-    /// Recursively check if any descendant is a Claude process
-    private func hasClaudeDescendant(pid: pid_t, claudePIDs: [pid_t]) -> Bool {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-P", "\(pid)"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return false }
-
-            let childPIDs = output.components(separatedBy: "\n")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-                .map { pid_t($0) }
-
-            for childPID in childPIDs {
-                if claudePIDs.contains(childPID) {
-                    return true
-                }
-                if hasClaudeDescendant(pid: childPID, claudePIDs: claudePIDs) {
-                    return true
-                }
-            }
-        } catch {}
-
+    private func isTerminalComm(_ comm: String) -> Bool {
+        let c = comm.lowercased()
+        // Strip common suffixes like ".app" or "Helper".
+        for name in terminalNames {
+            if c.contains(name) { return true }
+        }
         return false
     }
 }
