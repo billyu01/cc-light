@@ -128,16 +128,61 @@ class ProcessMonitor {
     }
 
     private func looksLikeSelectionPrompt(_ text: String) -> Bool {
-        let tail = text.components(separatedBy: "\n").suffix(40).joined(separator: "\n").lowercased()
-        if (tail.contains("1.") && tail.contains("2.") && tail.contains("3.")) { return true }
-        if (tail.contains("[1]") && tail.contains("[2]")) { return true }
-        if tail.contains("[y/n]") { return true }
-        if tail.contains("(y/n)") { return true }
-        if tail.contains("[y]") && tail.contains("[n]") { return true }
-        if tail.range(of: "\\? \\(?\\[?1-\\d\\]?\\)?", options: .regularExpression) != nil { return true }
-        if tail.contains("?") && tail.contains("1.") && tail.contains("2.") { return true }
-        // Claude Code's typical "Do you want to ..." menu
-        if tail.contains("do you want") && (tail.contains("yes") && tail.contains("no")) { return true }
+        // Claude Code's actual selection menu lives in the last few lines just
+        // above the input box. Looking 40 lines deep was too greedy — it
+        // false-positively matched any document or chat message that happens
+        // to contain "1." "2." "3.", which then *locked* the light on YELLOW
+        // because YELLOW outranks RED.
+        //
+        // Tighten the rule:
+        //   - only inspect the last 12 lines
+        //   - require LINE-START matches (after optional leading whitespace
+        //     and an optional bullet glyph "❯" / ">"), not substring hits
+        //   - require numbered items 1 and 2 to be on adjacent-ish lines
+        //   - drop the "do you want ... yes ... no" heuristic; it triggers on
+        //     ordinary prose
+        let lines = text.components(separatedBy: "\n")
+        let tail = Array(lines.suffix(12))
+        let lower = tail.map { $0.lowercased() }
+
+        // Yes/no prompts that Claude Code actually renders.
+        let joined = lower.joined(separator: "\n")
+        if joined.contains("[y/n]") { return true }
+        if joined.contains("(y/n)") { return true }
+        if joined.contains("(y/n/a)") { return true }
+
+        // Numbered menu: lines like "  ❯ 1. foo" or "1) foo" or "[1] foo".
+        // Pattern: optional leading whitespace, optional cursor glyph, then
+        // the digit, then "." or ")" or "]" — followed by a space and text.
+        let itemRe = try? NSRegularExpression(
+            pattern: #"^\s*(?:[❯>*]\s*)?(?:\[(\d+)\]|(\d+)[.)])\s+\S"#
+        )
+        guard let re = itemRe else { return false }
+
+        var firstItemLine: Int? = nil
+        var secondItemLine: Int? = nil
+        for (i, raw) in tail.enumerated() {
+            let ns = raw as NSString
+            let range = NSRange(location: 0, length: ns.length)
+            guard let m = re.firstMatch(in: raw, range: range) else { continue }
+            // Extract the digit from whichever group matched.
+            let g1 = m.range(at: 1), g2 = m.range(at: 2)
+            let digitStr: String
+            if g1.location != NSNotFound {
+                digitStr = ns.substring(with: g1)
+            } else if g2.location != NSNotFound {
+                digitStr = ns.substring(with: g2)
+            } else { continue }
+            guard let n = Int(digitStr) else { continue }
+            if n == 1 { firstItemLine = i }
+            if n == 2 { secondItemLine = i }
+        }
+
+        // Both "1" and "2" must appear, on lines close together (an actual
+        // menu, not coincidental numbered prose scattered around).
+        if let a = firstItemLine, let b = secondItemLine, abs(a - b) <= 3 {
+            return true
+        }
         return false
     }
 
