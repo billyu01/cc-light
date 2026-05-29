@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Traffic Light wrapper for Claude Code
+# Usage: traffic-light claude [args...]
+
+# Find the log directory
+LOG_DIR="/tmp/claude-traffic-light"
+mkdir -p "$LOG_DIR"
+
+# Generate unique log file based on PPID (terminal session)
+LOG_FILE="$LOG_DIR/output_$$_$(date +%s).log"
+
+# Create named pipe for capturing output
+PIPE_FILE="$LOG_DIR/pipe_$$"
+mkfifo "$PIPE_FILE" 2>/dev/null
+
+# Cleanup function
+cleanup() {
+    rm -f "$LOG_FILE" "$PIPE_FILE" 2>/dev/null
+}
+trap cleanup EXIT
+
+# Run claude and capture output
+# tee to both log file and stdout
+if command -v claude &> /dev/null; then
+    claude "$@" 2>&1 | tee "$LOG_FILE"
+else
+    echo "Error: claude command not found"
+    exit 1
+fi
