@@ -112,6 +112,16 @@ class WindowDetector {
 
     /// One subprocess call, parsed in Swift. Replaces dozens of per-pid
     /// invocations from the old implementation.
+    ///
+    /// Subprocess plumbing notes (this got us deadlocked once):
+    ///   - We MUST read stdout *before* calling waitUntilExit(). If ps writes
+    ///     more than the pipe buffer (16-64 KB) and nothing is reading the
+    ///     other end, ps blocks on write -> never exits -> waitUntilExit
+    ///     blocks forever. With 4-5 hundred lines of `ps -A` we live close to
+    ///     that limit.
+    ///   - stderr goes to /dev/null. A Pipe() that's never read has the same
+    ///     deadlock failure mode if ps prints anything to it (it can on
+    ///     newer macOS versions).
     private func readProcessSnapshot() -> ProcSnapshot {
         var snap = ProcSnapshot()
 
@@ -119,18 +129,22 @@ class WindowDetector {
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
         task.arguments = ["-Ao", "pid=,ppid=,comm="]
 
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
+        let outPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = FileHandle(forWritingAtPath: "/dev/null")
 
         do {
             try task.run()
-            task.waitUntilExit()
         } catch {
             return snap
         }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        // Read first, then wait. readDataToEndOfFile blocks until ps closes
+        // its stdout (i.e. until ps is done writing); ps then exits cleanly,
+        // and the subsequent waitUntilExit returns immediately.
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+
         guard let output = String(data: data, encoding: .utf8) else { return snap }
 
         for line in output.split(separator: "\n") {
