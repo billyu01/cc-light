@@ -1,5 +1,6 @@
 import Foundation
 import Cocoa
+import ApplicationServices
 import os.log
 
 private let logger = Logger(subsystem: "com.trafficlight.app", category: "monitor")
@@ -22,260 +23,297 @@ private func logToFile(_ message: String) {
 
 /// Traffic light state
 enum TrafficLightState {
-    case red      // Content is changing (Claude is outputting)
+    case red      // Claude is outputting
     case yellow   // Waiting for user selection
-    case green    // Completed/ready
+    case green    // Idle / completed
+}
+
+/// Per-window tracking state. Keyed by (pid, windowID) so multiple terminals
+/// belonging to the same app no longer trample each other.
+private struct WindowKey: Hashable {
+    let pid: pid_t
+    let windowID: CGWindowID
+}
+
+private struct WindowTrack {
+    var lastOutputHash: Int = 0
+    var lastChangeAt: Date = .distantPast
+    var lastState: TrafficLightState = .green
 }
 
 /// Monitors Claude Code terminal output via Accessibility API
 class ProcessMonitor {
-    private var lastContentHash: [pid_t: Int] = [:]
-    private var lastState: [pid_t: TrafficLightState] = [:]
+    private var tracks: [WindowKey: WindowTrack] = [:]
 
-    /// Get the current state for a Claude window
+    /// How long after the last detected output change we keep the light RED.
+    /// This swallows the spinner's "tick / no-tick" jitter and any single-poll
+    /// gaps where the AX text happens to be identical between two reads.
+    private let redHoldInterval: TimeInterval = 1.5
+
+    /// Get the current state for a Claude window.
     func getState(for window: ClaudeWindow) -> TrafficLightState {
-        // Get terminal content via Accessibility API
-        guard let content = getTerminalContent(for: window) else {
-            logToFile("Failed to get terminal content for pid \(window.processID)")
-            return lastState[window.processID] ?? .green
+        let key = WindowKey(pid: window.processID, windowID: window.windowID)
+        var track = tracks[key] ?? WindowTrack()
+
+        // 1. Pull terminal text for THIS specific window.
+        guard let rawContent = getTerminalContent(for: window) else {
+            logToFile("[\(window.windowID)] no AX content; keeping last state \(track.lastState)")
+            return track.lastState
         }
 
-        logToFile("Got content length: \(content.count)")
+        // 2. Strip the input-box region and the animated spinner/timer.
+        //    Only the "output region" should drive RED.
+        let outputRegion = stripInputBox(from: rawContent)
+        let normalized = normalizeForHash(outputRegion)
 
-        let state = analyzeContent(content, for: window.processID)
-        lastState[window.processID] = state
+        // 3. Decide state with correct priority: YELLOW > RED > GREEN.
+        let state = decideState(
+            outputRegion: outputRegion,
+            normalizedOutput: normalized,
+            track: &track,
+            windowID: window.windowID
+        )
+
+        track.lastState = state
+        tracks[key] = track
         return state
     }
 
-    /// Get terminal content via Accessibility API
+    /// Forget windows that no longer exist so the dictionary doesn't leak.
+    func prune(activeWindows: [ClaudeWindow]) {
+        let keep = Set(activeWindows.map { WindowKey(pid: $0.processID, windowID: $0.windowID) })
+        tracks = tracks.filter { keep.contains($0.key) }
+    }
+
+    // MARK: - State machine
+
+    private func decideState(
+        outputRegion: String,
+        normalizedOutput: String,
+        track: inout WindowTrack,
+        windowID: CGWindowID
+    ) -> TrafficLightState {
+        let now = Date()
+
+        // YELLOW first: explicit selection prompts. Highest priority — even if
+        // the spinner is still ticking, if the user is being asked to pick, the
+        // light should call that out.
+        if looksLikeSelectionPrompt(outputRegion) {
+            logToFile("[\(windowID)] YELLOW (selection prompt)")
+            return .yellow
+        }
+
+        // RED: the OUTPUT region's normalized hash actually changed, OR we are
+        // still inside the red-hold window after a recent change. Hold avoids
+        // the 1Hz green/red strobe caused by the spinner alternating frames.
+        let currentHash = normalizedOutput.hashValue
+        let changed = (track.lastOutputHash != 0) && (currentHash != track.lastOutputHash)
+        if track.lastOutputHash == 0 {
+            // First sample: seed without flagging a change.
+            track.lastOutputHash = currentHash
+        }
+        if changed {
+            track.lastChangeAt = now
+            track.lastOutputHash = currentHash
+            logToFile("[\(windowID)] RED (output changed)")
+            return .red
+        }
+        if now.timeIntervalSince(track.lastChangeAt) < redHoldInterval {
+            logToFile("[\(windowID)] RED (hold, \(String(format: "%.2f", now.timeIntervalSince(track.lastChangeAt)))s since last change)")
+            return .red
+        }
+
+        // GREEN: nothing changed for a while.
+        return .green
+    }
+
+    private func looksLikeSelectionPrompt(_ text: String) -> Bool {
+        let tail = text.components(separatedBy: "\n").suffix(40).joined(separator: "\n").lowercased()
+        if (tail.contains("1.") && tail.contains("2.") && tail.contains("3.")) { return true }
+        if (tail.contains("[1]") && tail.contains("[2]")) { return true }
+        if tail.contains("[y/n]") { return true }
+        if tail.contains("(y/n)") { return true }
+        if tail.contains("[y]") && tail.contains("[n]") { return true }
+        if tail.range(of: "\\? \\(?\\[?1-\\d\\]?\\)?", options: .regularExpression) != nil { return true }
+        if tail.contains("?") && tail.contains("1.") && tail.contains("2.") { return true }
+        // Claude Code's typical "Do you want to ..." menu
+        if tail.contains("do you want") && (tail.contains("yes") && tail.contains("no")) { return true }
+        return false
+    }
+
+    // MARK: - Content cleaning
+
+    /// Drop the bottom "input box" region. Claude Code's TUI draws the input
+    /// area with box-drawing borders (╭ ─ ╮ │ ╰ ╯). User keystrokes only
+    /// mutate text *inside* that region, so excluding it makes typing
+    /// invisible to the hash — which is exactly what we want.
+    private func stripInputBox(from content: String) -> String {
+        let lines = content.components(separatedBy: "\n")
+        // Walk from the bottom up; once we find a line that contains a
+        // box-drawing character, treat everything from there on as input chrome.
+        let boxChars: Set<Character> = ["╭", "╮", "╯", "╰", "─", "│", "┌", "┐", "└", "┘", "━", "┃"]
+        var cutoff = lines.count
+        for i in stride(from: lines.count - 1, through: max(0, lines.count - 8), by: -1) {
+            let line = lines[i]
+            if line.contains(where: { boxChars.contains($0) }) {
+                cutoff = i
+            }
+        }
+        if cutoff < lines.count {
+            return lines.prefix(cutoff).joined(separator: "\n")
+        }
+        return content
+    }
+
+    /// Strip animated bits that change every frame even when Claude is idle on
+    /// the spinner: braille spinner glyphs, the "(Ns · esc to interrupt)"
+    /// counter, and stray ANSI escape sequences.
+    private func normalizeForHash(_ text: String) -> String {
+        var out = text
+
+        // ANSI CSI sequences (e.g. cursor moves, color resets).
+        out = out.replacingOccurrences(
+            of: "\u{001B}\\[[0-9;?]*[ -/]*[@-~]",
+            with: "",
+            options: .regularExpression
+        )
+
+        // Braille spinner frames used by Claude Code and most TUI tools.
+        out = out.replacingOccurrences(
+            of: "[\u{2800}-\u{28FF}]",
+            with: "",
+            options: .regularExpression
+        )
+
+        // Other common spinner glyphs.
+        out = out.replacingOccurrences(
+            of: "[◐◓◑◒◴◷◶◵⣾⣽⣻⢿⡿⣟⣯⣷]",
+            with: "",
+            options: .regularExpression
+        )
+
+        // The elapsed-seconds counter Claude prints next to the spinner, e.g.
+        // "(12s · esc to interrupt)" or "(1m 4s · esc to interrupt)".
+        out = out.replacingOccurrences(
+            of: "\\((?:\\d+m\\s*)?\\d+s[^)]*\\)",
+            with: "",
+            options: .regularExpression
+        )
+
+        // "esc to interrupt" can also appear bare.
+        out = out.replacingOccurrences(of: "esc to interrupt", with: "")
+
+        // Token counters like "1.2k tokens" sometimes tick during streaming —
+        // collapse digit runs so that only structural changes matter.
+        out = out.replacingOccurrences(
+            of: "\\d+",
+            with: "#",
+            options: .regularExpression
+        )
+
+        return out
+    }
+
+    // MARK: - AX text extraction
+
+    /// Get terminal content for the specific window we care about.
+    /// Critically: when one terminal app hosts multiple windows (the common
+    /// case with iTerm2), `kAXWindowsAttribute` returns ALL of them. We must
+    /// pick the one whose on-screen frame matches `window.frame`, otherwise
+    /// the two traffic lights end up reading the same text.
     private func getTerminalContent(for window: ClaudeWindow) -> String? {
         let appRef = AXUIElementCreateApplication(window.processID)
 
-        var windows: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windows)
-
-        guard result == .success, let windowList = windows as? [AXUIElement] else {
+        var windowsRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef)
+        guard result == .success, let windowList = windowsRef as? [AXUIElement] else {
             return nil
         }
 
-        for axWindow in windowList {
-            // Try to get text content
-            if let content = extractTextFromElement(axWindow) {
-                return content
-            }
+        // Try to match by frame first.
+        if let matched = matchAXWindow(in: windowList, to: window.frame) {
+            return extractTextFromElement(matched)
+        }
+
+        // Fallback: only one window — must be it.
+        if windowList.count == 1 {
+            return extractTextFromElement(windowList[0])
+        }
+
+        // Last-resort fallback: the focused window.
+        var focused: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focused) == .success,
+           let el = focused, CFGetTypeID(el) == AXUIElementGetTypeID() {
+            return extractTextFromElement(el as! AXUIElement)
         }
 
         return nil
+    }
+
+    /// Pick the AX window whose position+size best matches the CGWindow frame.
+    private func matchAXWindow(in windows: [AXUIElement], to target: CGRect) -> AXUIElement? {
+        var best: (AXUIElement, CGFloat)? = nil
+        for w in windows {
+            guard let frame = axFrame(of: w) else { continue }
+            let dx = frame.origin.x - target.origin.x
+            let dy = frame.origin.y - target.origin.y
+            let dw = frame.size.width - target.size.width
+            let dh = frame.size.height - target.size.height
+            let dist = dx * dx + dy * dy + dw * dw + dh * dh
+            if best == nil || dist < best!.1 {
+                best = (w, dist)
+            }
+        }
+        // Require a reasonably tight match (within ~50px on each axis combined).
+        if let (w, d) = best, d < 10000 {
+            return w
+        }
+        return best?.0
+    }
+
+    private func axFrame(of element: AXUIElement) -> CGRect? {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let pos = posRef, let sz = sizeRef else { return nil }
+
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        // swiftlint:disable force_cast
+        AXValueGetValue(pos as! AXValue, .cgPoint, &point)
+        AXValueGetValue(sz as! AXValue, .cgSize, &size)
+        // swiftlint:enable force_cast
+        return CGRect(origin: point, size: size)
     }
 
     /// Recursively extract text from AXUIElement
     private func extractTextFromElement(_ element: AXUIElement) -> String? {
-        // Try to get value directly
         var value: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
-
         if let text = value as? String, text.count > 50 {
             return text
         }
 
-        // Try to get children and search recursively
         var children: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children)
-
-        guard let childList = children as? [AXUIElement] else {
-            return nil
-        }
+        guard let childList = children as? [AXUIElement] else { return nil }
 
         for child in childList {
-            // Check role
             var role: CFTypeRef?
             AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role)
-
-            if let r = role as? String {
-                // Look for text-related roles
-                if r == "AXTextArea" || r == "AXStaticText" || r == "AXWebArea" {
-                    var childValue: CFTypeRef?
-                    AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &childValue)
-
-                    if let text = childValue as? String, text.count > 50 {
-                        return text
-                    }
+            if let r = role as? String,
+               r == "AXTextArea" || r == "AXStaticText" || r == "AXWebArea" {
+                var childValue: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &childValue)
+                if let text = childValue as? String, text.count > 50 {
+                    return text
                 }
             }
-
-            // Recursively search
             if let text = extractTextFromElement(child) {
                 return text
             }
         }
-
         return nil
-    }
-
-    /// Analyze content to determine state
-    private func analyzeContent(_ content: String, for pid: pid_t) -> TrafficLightState {
-        let lines = content.components(separatedBy: "\n")
-        let lastLines = lines.suffix(30).joined(separator: "\n").lowercased()
-
-        // Check if content changed
-        let currentHash = content.hashValue
-        let previousHash = lastContentHash[pid]
-        let contentChanged = (previousHash != nil && currentHash != previousHash)
-
-        logToFile("Content analysis - length: \(content.count), changed: \(contentChanged), prevHash: \(previousHash ?? 0), currHash: \(currentHash)")
-
-        lastContentHash[pid] = currentHash
-
-        // RED - content is changing (output in progress) - check first
-        if contentChanged {
-            logToFile("State: RED (content changed)")
-            return .red
-        }
-
-        // YELLOW patterns (waiting for user SELECTION)
-        let hasNumberedOptions = (
-            // Format: 1. ... 2. ... 3. ...
-            (lastLines.contains("1.") && lastLines.contains("2.") && lastLines.contains("3.")) ||
-            // Format: [1] ... [2] ...
-            (lastLines.contains("[1]") && lastLines.contains("[2]")) ||
-            // Format: [y/n]
-            lastLines.contains("[y/n]") ||
-            (lastLines.contains("[y]") && lastLines.contains("[n]")) ||
-            // Format: ? (1-3) or ? [1-3]
-            lastLines.range(of: "\\? \\(?\\[?1-\\d\\]?\\)?", options: .regularExpression) != nil ||
-            // Format with question and numbered list
-            (lastLines.contains("?") && lastLines.contains("1.") && lastLines.contains("2."))
-        )
-
-        if hasNumberedOptions {
-            logToFile("State: YELLOW (numbered options)")
-            return .yellow
-        }
-
-        // GREEN patterns (completed/ready)
-        let greenPatterns = [
-            "task completed",
-            "任务完成",
-            "已完成",
-            "✓",
-            "✅",
-            "done!",
-            "finished",
-            "all done",
-            "完成！",
-            "worked for",
-            "recap:",
-            "what can i help",
-            "有什么我可以帮助",
-            "how can i help"
-        ]
-
-        for pattern in greenPatterns {
-            if lastLines.contains(pattern) {
-                return .green
-            }
-        }
-
-        // Check last line for shell prompt (idle = GREEN)
-        if let lastLine = lines.last {
-            let trimmed = lastLine.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasSuffix(">") || trimmed.hasSuffix("❯") || trimmed.hasSuffix("$") || trimmed.hasSuffix("%") {
-                return .green
-            }
-        }
-
-        // Default: if Claude process exists and content is stable, it's waiting for input (GREEN)
-        // Not YELLOW - yellow is only for explicit selection prompts
-        return .green
-    }
-
-    /// Find Claude process running in a terminal
-    private func findClaudeProcessForTerminal(terminalPID: pid_t) -> pid_t? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-P", "\(terminalPID)"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return nil }
-
-            let childPIDs = output.components(separatedBy: "\n")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-                .map { pid_t($0) }
-
-            for childPID in childPIDs {
-                if isClaudeProcess(childPID) {
-                    return childPID
-                }
-                if let claudePID = findClaudeDescendant(childPID) {
-                    return claudePID
-                }
-            }
-            return nil
-        } catch {
-            return nil
-        }
-    }
-
-    /// Recursively find Claude process among descendants
-    private func findClaudeDescendant(_ pid: pid_t) -> pid_t? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-P", "\(pid)"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return nil }
-
-            let childPIDs = output.components(separatedBy: "\n")
-                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-                .map { pid_t($0) }
-
-            for childPID in childPIDs {
-                if isClaudeProcess(childPID) {
-                    return childPID
-                }
-                if let found = findClaudeDescendant(childPID) {
-                    return found
-                }
-            }
-            return nil
-        } catch {
-            return nil
-        }
-    }
-
-    /// Check if a process is Claude
-    private func isClaudeProcess(_ pid: pid_t) -> Bool {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-p", "\(pid)", "-o", "comm="]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return false }
-
-            return output.trimmingCharacters(in: .whitespacesAndNewlines).contains("claude")
-        } catch {
-            return false
-        }
     }
 }

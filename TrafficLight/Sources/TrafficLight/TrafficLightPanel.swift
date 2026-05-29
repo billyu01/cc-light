@@ -7,14 +7,11 @@ private let logger = Logger(subsystem: "com.trafficlight.app", category: "panel"
 /// Floating panel that displays a traffic light for a Claude window
 class TrafficLightPanel: NSPanel {
     private let claudeWindow: ClaudeWindow
-    private let processMonitor: ProcessMonitor
     private var hostingView: NSHostingView<TrafficLightView>?
     private var currentState: TrafficLightState = .green
-    private var timer: Timer?
 
-    init(claudeWindow: ClaudeWindow, processMonitor: ProcessMonitor) {
+    init(claudeWindow: ClaudeWindow) {
         self.claudeWindow = claudeWindow
-        self.processMonitor = processMonitor
 
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 40, height: 100),
@@ -32,7 +29,6 @@ class TrafficLightPanel: NSPanel {
         self.hidesOnDeactivate = false
 
         setupView()
-        startMonitoring()
     }
 
     private func setupView() {
@@ -62,17 +58,18 @@ class TrafficLightPanel: NSPanel {
     }
 
     private func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.checkState()
-        }
+        // Monitoring is owned by TrafficLightManager now; nothing to do here.
+    }
+
+    /// Push a new state in from the manager.
+    func apply(state: TrafficLightState) {
+        guard state != currentState else { return }
+        currentState = state
+        updateView()
     }
 
     private func checkState() {
-        let newState = processMonitor.getState(for: claudeWindow)
-        if newState != currentState {
-            currentState = newState
-            updateView()
-        }
+        // Deprecated path kept only to avoid breaking callers; manager pushes state.
     }
 
     private func updateView() {
@@ -93,7 +90,6 @@ class TrafficLightPanel: NSPanel {
     }
 
     deinit {
-        timer?.invalidate()
     }
 }
 
