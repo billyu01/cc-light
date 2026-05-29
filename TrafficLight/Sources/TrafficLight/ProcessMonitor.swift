@@ -181,9 +181,21 @@ class ProcessMonitor {
         // Both "1" and "2" must appear, on lines close together (an actual
         // menu, not coincidental numbered prose scattered around).
         if let a = firstItemLine, let b = secondItemLine, abs(a - b) <= 3 {
+            // Diagnostic: log the actual lines that triggered the match so
+            // we can tell real menus from prose false-positives.
+            logToFile("YELLOW match: line[\(a)]=\(repr(tail[a])) line[\(b)]=\(repr(tail[b]))")
             return true
         }
         return false
+    }
+
+    /// Show invisible characters so we can see what AX really gave us.
+    private func repr(_ s: String) -> String {
+        let truncated = s.count > 120 ? String(s.prefix(120)) + "…" : s
+        return "\"" + truncated
+            .replacingOccurrences(of: "\t", with: "\\t")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            + "\""
     }
 
     // MARK: - Content cleaning

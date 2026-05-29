@@ -1,4 +1,17 @@
+# Build artifacts
 .build/
+
+# macOS
 .DS_Store
+
+# Editor / swap
 *.swp
+
+# Local debugging output
 /tmp
+
+# Local binary backups created during deploy
+*.bak-*
+
+# codesign re-signs the bundle on every deploy; tracking these creates noise
+TrafficLight.app/Contents/_CodeSignature/
