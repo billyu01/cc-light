@@ -8,6 +8,103 @@
 🟢 绿灯  空闲，等你输入
 ```
 
+## 技术栈
+
+| 层 | 选型 | 备注 |
+|---|---|---|
+| 语言 | Swift 5.9 | `swift-tools-version: 5.9` |
+| 构建 | Swift Package Manager | `swift build -c release`，单一 executable target |
+| UI | SwiftUI（漫画风灯泡）+ AppKit（NSPanel 窗口宿主） | SwiftUI 画灯，AppKit 处理窗口浮层和鼠标事件 |
+| 进程托管 | AppKit `NSApplication` + `NSStatusItem` | `LSUIElement=true`，无 Dock 图标，状态栏菜单驻留 |
+| 终端文本采集 | macOS Accessibility API（`AXUIElement*`） | 只读模式，不模拟键鼠，需要"辅助功能"权限 |
+| 进程发现 | `/bin/ps -Ao pid=,ppid=,comm=` | 单次 fork 拉全表，Swift 内走父子关系树 |
+| 屏幕窗口枚举 | Core Graphics `CGWindowListCopyWindowInfo` | 拿窗口 ID、frame、所属 pid |
+| 调度 | `Timer` + 后台 `DispatchQueue` | 单一 0.5s timer，重活跑后台、UI 切回主线程 |
+| 平台 | macOS 13+，Apple Silicon（arm64） | Info.plist `LSMinimumSystemVersion=13.0` |
+| 签名 | ad-hoc `codesign -s -` | 没有 Developer ID / Notarization |
+
+依赖：**零第三方依赖**，纯 Apple 系统框架（AppKit / SwiftUI / ApplicationServices / CoreGraphics / Foundation / Combine / os.log）。
+
+## 技术方案
+
+### 整体数据流
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  TrafficLightManager  (单一 0.5s Timer)                     │
+│                                                             │
+│   tick() ── DispatchQueue("com.trafficlight.work") ──┐      │
+│                                                      │      │
+│   ┌──────────────────────────────────────────────────┘      │
+│   │ 1. WindowDetector.detectClaudeWindows()                 │
+│   │      ps -A 一次 → 进程表 → 找 claude → 沿 ppid 上溯     │
+│   │      → 终端 App pid → CGWindowList 匹配窗口             │
+│   │                                                         │
+│   │ 2. for 每个窗口:                                        │
+│   │      ProcessMonitor.getState(window)                    │
+│   │        AXUIElement 取文本                               │
+│   │        → stripInputBox() / normalizeForHash()           │
+│   │        → 状态机: YELLOW > RED(含1.5s hold) > GREEN      │
+│   │                                                         │
+│   │ 3. DispatchQueue.main.async {                           │
+│   │      diff 增删 NSPanel                                  │
+│   │      panel.updatePosition + panel.apply(state:)         │
+│   │    }                                                    │
+│   └─────────────────────────────────────────────────────────┘
+│                                                             │
+│  TrafficLightPanel (NSPanel × N，每个 Claude 窗口一个)      │
+│    NSHostingView<TrafficLightView>  ←  SwiftUI 画灯泡       │
+│    mouseDown/mouseDragged/mouseUp   ←  单击聚焦 / 拖动      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 模块划分（5 个 Swift 文件）
+
+| 文件 | 职责 |
+|---|---|
+| `main.swift` | 程序入口，创建 `NSApplication` |
+| `AppDelegate.swift` | 申请 AX 权限、建状态栏菜单、`setActivationPolicy(.accessory)` 隐藏 Dock 图标、装配三大模块 |
+| `WindowDetector.swift` | 一次 `ps -A` 拉全表 → 在内存里走进程树找终端宿主 → CG 拿窗口 → 输出 `[ClaudeWindow]` |
+| `ProcessMonitor.swift` | 通过 AX 抓终端文本 → 清洗 → 状态机决策。按 `(pid, windowID)` 隔离每个窗口的历史 |
+| `TrafficLightManager.swift` | 唯一调度者：拥有 timer、后台队列、panel 字典；负责 tick / diff / 推送状态 |
+| `TrafficLightPanel.swift` | 每个 Claude 窗口对应的 `NSPanel`，承载 SwiftUI 视图，处理鼠标事件 |
+
+### 三个关键设计决策
+
+**1. 状态判定不依赖关键字猜测，靠"输出区 hash 是否在变"。**
+天真的"匹配 ✓ / done / 任务完成"在中英文混杂、自定义提示词下完全不可靠。我们改成：把 ANSI 转义、Claude Code 的盲文 spinner（`⠋⠙⠹...`）、`(Ns · esc to interrupt)` 计时器、所有数字、底部输入框区域（按 `╭─╮│╰╯` 边框识别）从屏幕文本里全部剔除，再算 hash。**剩下的就是"真正的输出"**。Hash 一变 → RED；最近一次变化算起的 1.5 秒内继续 RED（去抖，避免 spinner 抖动让灯 1Hz 闪烁）；超时 → GREEN。YELLOW 优先级最高，匹配数字菜单 / `[y/n]` 等。
+
+**2. 重活全部丢到后台队列，主线程只摸 UI。**
+最早的版本把 `ps` / `pgrep` / AX 调用都放在主线程的 timer 回调里。`-[NSConcreteTask waitUntilExit]` 是同步阻塞，单次 tick 累计 200-500ms，鼠标 hover 上去主线程没空响应 → 光标变 spinner。改造后：`com.trafficlight.work` 串行队列里完成所有 fork+exec 和 AX 树遍历，**主线程只负责创建/关闭 panel、设置位置、setColor**。CPU 从 27% 降到 7%，RSS 从 261 MB 降到 50 MB。
+
+**3. 用 `(pid, windowID)` 而不是仅 pid 隔离窗口状态。**
+同一个终端 App（如 iTerm2）能开多个窗口，pid 是 App 级的，不能区分窗口。这导致两盏灯互相窜状态。修复：状态字典用复合键，`getTerminalContent` 时按 `kAXPositionAttribute / kAXSizeAttribute` 与目标 frame 做最近匹配，挑出正确的那个 AX 窗口。
+
+### 鼠标事件路径
+
+`NSPanel` 的 `mouseDown` 不能直接调 `performDrag(with:)`——后者是阻塞的，泵主线程 run loop 直到鼠标抬起，纯按一下不动会卡光标。正确拆法：
+
+| 事件 | 行为 |
+|---|---|
+| `mouseDown` | 记起点，立即返回 |
+| `mouseDragged` | 移动 > 4px 才启动 `performDrag`（确认是真拖动） |
+| `mouseUp` | 没拖过 → 单击 → `focusTerminal()` |
+
+`focusTerminal()` 走 AX：`AXUIElementCopyAttributeValue(... kAXWindowsAttribute ...)` 拿到 App 全部窗口 → 按 frame 匹配到目标 → `kAXRaiseAction` + `kAXMainAttribute=true` + `kAXFocusedAttribute=true` → 最后再 `NSRunningApplication.activate` 把 App 拉到最前。**先 raise 后 activate**，确保多窗口时打到正确窗口。
+
+### 调试
+
+运行时所有内部决策都写到 `/tmp/trafficlight_debug.log`，格式：
+
+```
+[14:34:55] [windowID] 状态 (原因)
+[14:34:55] [563] RED (output changed)
+[14:34:55] [606] RED (hold, 0.48s since last change)
+[14:34:56] [1266] YELLOW (selection prompt)
+```
+
+`tail -f` 实时看，能直接定位"为什么这盏灯现在是这个颜色"。
+
 ## 使用手册
 
 ### 1. 安装
